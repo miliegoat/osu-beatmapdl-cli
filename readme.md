@@ -1,6 +1,8 @@
 osu tui downloader
 
 simple terminal ui app to search and download osu! beatmaps
+q: why does this require oauth?
+a: search is implemented using osu.ppy.sh api instead of relying on some other api
 
 features
 - osu api v2 search
