@@ -14,13 +14,11 @@ THEMES = list(BUILTIN_THEMES.keys())
 
 MIRRORS = [
     "https://api.nerinyan.moe/d/{id}",
-    "https://beatconnect.io/b/{id}",
-    "https://dl.simon.online/b/{id}",
+    "https://catboy.best/d/{id}"
 ]
 
 BACKUP_DB_MIRRORS = [
     "https://chimu.moe/d/{id}",
-    "https://catboy.best/d/{id}",
 ]
 
 OSU_TOKEN_URL = "https://osu.ppy.sh/oauth/token"
