@@ -1,7 +1,9 @@
 import os
+import json
 import time
 import threading
 import requests
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from textual.app import App, ComposeResult
@@ -61,6 +63,104 @@ SORT_OPTIONS = [
 
 # Tokens used as "no filter" sentinels in Select widgets
 _NO_FILTER_TOKENS = {"_all", "_any", "_default"}
+
+
+class ConfigManager:
+    """Manages loading and saving application settings to a JSON config file."""
+    
+    def __init__(self, config_path: str | None = None):
+        if config_path:
+            self.config_path = Path(config_path)
+        else:
+            # Use XDG-compliant config path on Linux/macOS, fallback for Windows
+            if "XDG_CONFIG_HOME" in os.environ:
+                config_dir = Path(os.environ["XDG_CONFIG_HOME"]) / "osu-beatmapdl"
+            else:
+                config_dir = Path.home() / ".config" / "osu-beatmapdl"
+            
+            self.config_path = config_dir / "config.json"
+        
+        self.config = self._load()
+    
+    def _default_config(self) -> dict:
+        """Return the default configuration structure."""
+        return {
+            "version": "1.0",
+            "auth": {
+                "client_id": "",
+                "client_secret": "",
+                "save_credentials": False,
+            },
+            "download": {
+                "path": os.path.expanduser("~/Downloads"),
+                "max_parallel": MAX_PARALLEL_DOWNLOADS,
+                "chunk_size": CHUNK_SIZE,
+            },
+            "ui": {
+                "theme": "nord",
+            },
+            "advanced": {
+                "connect_timeout": CONNECT_TIMEOUT,
+                "read_timeout": READ_TIMEOUT,
+            }
+        }
+    
+    def _load(self) -> dict:
+        """Load config from file, or return defaults if file doesn't exist."""
+        if self.config_path.exists():
+            try:
+                with open(self.config_path, "r") as f:
+                    loaded = json.load(f)
+                    # Merge with defaults to handle missing keys
+                    defaults = self._default_config()
+                    return self._deep_merge(defaults, loaded)
+            except Exception as e:
+                print(f"Warning: Failed to load config from {self.config_path}: {e}")
+        
+        return self._default_config()
+    
+    def _deep_merge(self, defaults: dict, loaded: dict) -> dict:
+        """Deep merge loaded config with defaults, preserving loaded values."""
+        result = defaults.copy()
+        for key, value in loaded.items():
+            if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+                result[key] = self._deep_merge(result[key], value)
+            else:
+                result[key] = value
+        return result
+    
+    def save(self) -> bool:
+        """Save current config to file. Create directory if it doesn't exist."""
+        try:
+            self.config_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.config_path, "w") as f:
+                json.dump(self.config, f, indent=2)
+            return True
+        except Exception as e:
+            print(f"Warning: Failed to save config to {self.config_path}: {e}")
+            return False
+    
+    def get(self, key: str, default=None):
+        """Get config value using dot notation. Example: get('auth.client_id')"""
+        keys = key.split(".")
+        value = self.config
+        for k in keys:
+            if isinstance(value, dict) and k in value:
+                value = value[k]
+            else:
+                return default
+        return value
+    
+    def set(self, key: str, value):
+        """Set config value using dot notation. Example: set('auth.client_id', 'xyz')"""
+        keys = key.split(".")
+        target = self.config
+        for k in keys[:-1]:
+            if k not in target:
+                target[k] = {}
+            target = target[k]
+        target[keys[-1]] = value
+
 
 
 def safe_filename(name: str, max_len: int = 100) -> str:
@@ -422,13 +522,20 @@ class OsuTui(App):
 
     def __init__(self):
         super().__init__()
+        self.config = ConfigManager()
         self.downloader = OsuDownloader()
         self.results: list = []
         self.selected_rows: set[int] = set()
-        self.download_path = os.path.expanduser("~/Downloads")
+        self.download_path = self.config.get("download.path", os.path.expanduser("~/Downloads"))
         self._progress_lock = threading.Lock()
         self._completed_counts: dict[int, int] = {}
         self._theme_index = 0
+        
+        # Load theme from config
+        saved_theme = self.config.get("ui.theme", "nord")
+        if saved_theme in THEMES:
+            self._theme_index = THEMES.index(saved_theme)
+            self.theme = saved_theme
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -437,6 +544,17 @@ class OsuTui(App):
 
     def on_mount(self) -> None:
         self.query_one("#path-input", Input).value = self.download_path
+        
+        # Load saved credentials if they exist
+        saved_client_id = self.config.get("auth.client_id", "")
+        saved_client_secret = self.config.get("auth.client_secret", "")
+        save_credentials = self.config.get("auth.save_credentials", False)
+        
+        if save_credentials and saved_client_id:
+            self.query_one("#client-id", Input).value = saved_client_id
+            if saved_client_secret:
+                self.query_one("#client-secret", Input).value = saved_client_secret
+        
         # Pre-populate table columns so clicks before any search don't crash
         table = self.query_one("#results", DataTable)
         table.add_columns("", "#", "ID", "Artist", "Title", "Creator", "Maps", "Status")
@@ -457,11 +575,15 @@ class OsuTui(App):
                 self.theme = val
                 if val in THEMES:
                     self._theme_index = THEMES.index(val)
+                    self.config.set("ui.theme", val)
+                    self.config.save()
 
     def action_next_theme(self) -> None:
         self._theme_index = (self._theme_index + 1) % len(THEMES)
         new_theme = THEMES[self._theme_index]
         self.theme = new_theme
+        self.config.set("ui.theme", new_theme)
+        self.config.save()
         try:
             self.query_one("#theme-select", Select).value = new_theme
         except Exception:
@@ -511,7 +633,16 @@ class OsuTui(App):
 
         def _run():
             success = self.downloader.authenticate(client_id, client_secret)
-            msg = "Authenticated successfully. Ready to search!" if success else "Authentication failed — check your credentials."
+            if success:
+                # Save credentials to config on successful authentication
+                self.config.set("auth.client_id", client_id)
+                self.config.set("auth.client_secret", client_secret)
+                self.config.set("auth.save_credentials", True)
+                self.config.save()
+                msg = "Authenticated successfully. Ready to search!"
+            else:
+                msg = "Authentication failed — check your credentials."
+            
             color = "ok" if success else "err"
             self.call_later(lambda: self.set_status(msg, color=color))
 
@@ -629,6 +760,12 @@ class OsuTui(App):
 
     def _download_batch(self, indices: list[int]) -> None:
         path = self.query_one("#path-input", Input).value.strip() or self.download_path
+        
+        # Save the download path to config
+        self.config.set("download.path", path)
+        self.config.save()
+        self.download_path = path
+        
         count = len(indices)
         self.set_status(f"Starting {count} downloads (up to {MAX_PARALLEL_DOWNLOADS} parallel)…", color="muted")
         self.set_progress(0)
