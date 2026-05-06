@@ -61,7 +61,7 @@ SORT_OPTIONS = [
     ("Ranked ↓", "ranked_desc"),
 ]
 
-# Tokens used as "no filter" sentinels in Select widgets
+# Tokens used as "no filter" sentinels in Select widgets 67
 _NO_FILTER_TOKENS = {"_all", "_any", "_default"}
 
 
