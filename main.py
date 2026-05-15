@@ -1,10 +1,11 @@
 import os
 import json
+import re
 import time
 import threading
 import requests
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical
@@ -17,7 +18,8 @@ THEMES = list(BUILTIN_THEMES.keys())
 
 MIRRORS = [
     "https://api.nerinyan.moe/d/{id}",
-    "https://catboy.best/d/{id}"
+    "https://catboy.best/d/{id}",
+    "https://beatconnect.io/b/{id}",
 ]
 
 BACKUP_DB_MIRRORS = [
@@ -30,10 +32,14 @@ OSU_BEATMAPSET_URL = "https://osu.ppy.sh/api/v2/beatmapsets/{id}"
 OSUCOLLECTOR_API = "https://osucollector.com/api/collections/{id}"
 OSUCOLLECTOR_BEATMAPSETS_API = "https://osucollector.com/api/collections/{id}/beatmapsets"
 
-MAX_PARALLEL_DOWNLOADS = 10
+MAX_PARALLEL_DOWNLOADS = 8
 CHUNK_SIZE = 65_536
 CONNECT_TIMEOUT = 8
 READ_TIMEOUT = 60
+
+MIRROR_SPEED_THRESHOLD = 0.5
+MIRROR_RATE_LIMIT_COOLDOWN = 30
+MIRROR_MAX_SAMPLES = 10
 
 MODE_OPTIONS = [
     ("All Modes", "_all"),
@@ -155,7 +161,6 @@ class ConfigManager:
         target[keys[-1]] = value
 
 
-
 def safe_filename(name: str, max_len: int = 100) -> str:
     return "".join(c for c in name if c.isalnum() or c in " -_").strip()[:max_len]
 
@@ -164,9 +169,75 @@ _session = requests.Session()
 _session.headers.update({"User-Agent": "osu-dl/2.0"})
 
 
+class MirrorManager:
+    def __init__(self, speed_threshold: float = MIRROR_SPEED_THRESHOLD, rate_limit_cooldown: int = MIRROR_RATE_LIMIT_COOLDOWN):
+        self._lock = threading.Lock()
+        self._stats: dict[str, dict] = {}
+        self._speed_threshold = speed_threshold
+        self._rate_limit_cooldown = rate_limit_cooldown
+
+    def _get(self, url: str) -> dict:
+        if url not in self._stats:
+            self._stats[url] = {
+                "speeds": [],
+                "avg_speed": 0.0,
+                "total": 0,
+                "failures": 0,
+                "slow_count": 0,
+                "cooldown": 0.0,
+            }
+        return self._stats[url]
+
+    def _weighted_avg(self, speeds: list[float]) -> float:
+        if not speeds:
+            return 0.0
+        n = len(speeds)
+        weights = [1 + (i / n) for i in range(n)]
+        return sum(s * w for s, w in zip(speeds, weights)) / sum(weights)
+
+    def rank(self, mirrors: list[str]) -> list[str]:
+        with self._lock:
+            now = time.monotonic()
+            scored = []
+            for url in mirrors:
+                s = self._get(url)
+                in_cooldown = now < s["cooldown"]
+                penalty = s["failures"] * 50 + in_cooldown * 10000
+                if in_cooldown:
+                    scored.append((penalty, url))
+                elif s["total"] == 0:
+                    scored.append((-0.1, url))
+                else:
+                    scored.append((penalty - s["avg_speed"] * 2, url))
+            scored.sort(key=lambda x: x[0])
+            return [url for _, url in scored]
+
+    def success(self, url: str, speed: float):
+        with self._lock:
+            s = self._get(url)
+            s["total"] += 1
+            s["failures"] = 0
+            s["speeds"].append(speed)
+            if len(s["speeds"]) > MIRROR_MAX_SAMPLES:
+                s["speeds"].pop(0)
+            s["avg_speed"] = self._weighted_avg(s["speeds"])
+            if speed < self._speed_threshold:
+                s["slow_count"] += 1
+            else:
+                s["slow_count"] = max(0, s["slow_count"] - 1)
+
+    def failure(self, url: str, rate_limited: bool = False):
+        with self._lock:
+            s = self._get(url)
+            s["failures"] += 1
+            if rate_limited:
+                s["cooldown"] = time.monotonic() + self._rate_limit_cooldown
+
+
 class OsuDownloader:
-    def __init__(self):
+    def __init__(self, mirror_manager: MirrorManager | None = None):
         self.access_token: str | None = None
+        self._mirror_manager = mirror_manager or MirrorManager()
 
     def authenticate(self, client_id: str, client_secret: str) -> bool:
         payload = {
@@ -238,14 +309,23 @@ class OsuDownloader:
                 progress_callback(i + 1, total)
         return enriched
 
-    def _try_mirror(self, url: str, file_path: str, progress_callback=None, speed_callback=None) -> tuple[bool, str]:
+    def _try_mirror(self, url: str, file_path: str, progress_callback=None, speed_callback=None, cancel_check=None, pause_check=None) -> tuple[bool, str, float]:
+        if cancel_check and cancel_check():
+            return False, "cancelled", 0.0
+        if pause_check and pause_check():
+            return False, "paused", 0.0
+        partial_path = file_path + ".part"
+        try:
+            os.remove(partial_path)
+        except OSError:
+            pass
         try:
             r = _session.get(url, stream=True, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), allow_redirects=True)
 
             if r.status_code in (404, 429, 403):
-                return False, f"HTTP {r.status_code}"
+                return False, f"HTTP {r.status_code}", 0.0
             if r.status_code != 200:
-                return False, f"HTTP {r.status_code}"
+                return False, f"HTTP {r.status_code}", 0.0
 
             content_type = r.headers.get("content-type", "").lower()
             content_length = int(r.headers.get("content-length", 0) or 0)
@@ -257,12 +337,12 @@ class OsuDownloader:
 
             if "json" in content_type or (0 < content_length < 500):
                 try:
-                    return False, r.json().get("error", "mirror error")
+                    return False, r.json().get("error", "mirror error"), 0.0
                 except Exception:
-                    return False, "invalid response"
+                    return False, "invalid response", 0.0
 
             if not is_file:
-                return False, "unexpected content"
+                return False, "unexpected content", 0.0
 
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
@@ -270,8 +350,12 @@ class OsuDownloader:
             start_time = time.monotonic()
             speed_tick = start_time
 
-            with open(file_path, "wb") as f:
+            with open(partial_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
+                    if cancel_check and cancel_check():
+                        return False, "cancelled", 0.0
+                    if pause_check and pause_check():
+                        return False, "paused", 0.0
                     f.write(chunk)
                     bytes_downloaded += len(chunk)
 
@@ -286,14 +370,17 @@ class OsuDownloader:
                             speed_callback(bytes_downloaded / elapsed / 1_048_576)
                         speed_tick = now
 
-            return True, file_path
+            os.replace(partial_path, file_path)
+            elapsed = time.monotonic() - start_time
+            final_speed = bytes_downloaded / elapsed / 1_048_576 if elapsed > 0 else 0.0
+            return True, file_path, final_speed
 
         except requests.exceptions.Timeout:
-            return False, "timed out"
+            return False, "timed out", 0.0
         except requests.exceptions.ConnectionError as e:
-            return False, f"connection error: {str(e)[:40]}"
+            return False, f"connection error: {str(e)[:40]}", 0.0
         except Exception as e:
-            return False, f"error: {str(e)[:60]}"
+            return False, f"error: {str(e)[:60]}", 0.0
 
     def download(
         self,
@@ -302,17 +389,26 @@ class OsuDownloader:
         title: str | None = None,
         progress_callback=None,
         speed_callback=None,
+        cancel_check=None,
+        pause_check=None,
     ) -> tuple[bool, str]:
         name = safe_filename(title) if title else str(beatmapset_id)
         file_path = os.path.join(path, f"{name}.osz")
 
         all_mirrors = MIRRORS + BACKUP_DB_MIRRORS
+        ordered = self._mirror_manager.rank(all_mirrors)
 
-        for mirror_template in all_mirrors:
+        for mirror_template in ordered:
+            if cancel_check and cancel_check():
+                return False, "cancelled"
+            if pause_check and pause_check():
+                return False, "paused"
             url = mirror_template.format(id=beatmapset_id)
-            ok, result = self._try_mirror(url, file_path, progress_callback, speed_callback)
+            ok, result, speed = self._try_mirror(url, file_path, progress_callback, speed_callback, cancel_check=cancel_check, pause_check=pause_check)
             if ok:
+                self._mirror_manager.success(mirror_template, speed)
                 return True, result
+            self._mirror_manager.failure(mirror_template, rate_limited="429" in result)
 
         return False, f"all {len(all_mirrors)} mirrors failed"
 
@@ -385,8 +481,49 @@ class OsuCollectorScraper:
             return "", []
 
 
+class ConfirmCancelScreen(ModalScreen):
+    CSS = """
+    ConfirmCancelScreen {
+        align: center middle;
+    }
+    #cancel-dialog {
+        width: 50;
+        height: auto;
+        border: tall $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    #cancel-msg {
+        color: $foreground;
+        text-align: center;
+        margin-bottom: 1;
+    }
+    #cancel-buttons {
+        align: center middle;
+        height: auto;
+        margin-top: 1;
+    }
+    #cancel-buttons Button {
+        width: 18;
+        margin: 0 1;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="cancel-dialog"):
+            yield Static("Cancel all active downloads?", id="cancel-msg")
+            with Horizontal(id="cancel-buttons"):
+                yield Button("Yes, Cancel", id="cancel-yes", variant="error")
+                yield Button("No", id="cancel-no")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel-yes":
+            self.dismiss("cancel")
+        else:
+            self.dismiss(None)
+
+
 class AuthPromptScreen(ModalScreen):
-    """Modal dialog asking the user whether to authenticate before loading a collection."""
 
     CSS = """
     AuthPromptScreen {
@@ -486,7 +623,6 @@ class MainScreen(Container):
         with Horizontal(id="path-row"):
             yield Input(placeholder="Download path", id="path-input")
 
-
         yield Static("", id="status")
 
         with Horizontal(id="progress-row"):
@@ -494,6 +630,8 @@ class MainScreen(Container):
             yield ProgressBar(id="progress", show_percentage=False, total=100)
             yield Static("", id="speed")
             yield Button("Skip", id="skip-enrich-btn", classes="hidden")
+            yield Button("Pause", id="pause-btn", classes="hidden")
+            yield Button("Cancel", id="cancel-btn", variant="error", classes="hidden")
 
         yield DataTable(id="results", cursor_type="row")
 
@@ -606,8 +744,20 @@ class OsuTui(App):
         margin-left: 1;
         display: none;
     }
-    #skip-enrich-btn.visible {
+    #skip-enrich-btn.visible, #pause-btn.visible, #cancel-btn.visible {
         display: block;
+    }
+    #pause-btn {
+        width: 10;
+        height: 3;
+        margin-left: 1;
+        display: none;
+    }
+    #cancel-btn {
+        width: 10;
+        height: 3;
+        margin-left: 1;
+        display: none;
     }
     #progress-text {
         width: 6;
@@ -683,8 +833,16 @@ class OsuTui(App):
         self.selected_rows: set[int] = set()
         self.download_path = self.config.get("download.path", os.path.expanduser("~/Downloads"))
         self._progress_lock = threading.Lock()
-        self._completed_counts: dict[int, int] = {}
+        self._is_downloading = False
+        self._is_paused = False
+        self._completed_indices: set[int] = set()
+        self._failed_indices: set[int] = set()
+        self._pending_indices: list[int] = []
+        self._failed_map_names: list[str] = []
+        self._retry_count: dict[int, int] = {}
+        self._max_retries = 3
         self._cancel_event = threading.Event()
+        self._pause_event = threading.Event()
         self._skip_enrich_event = threading.Event()
         self._theme_index = 0
         saved_theme = self.config.get("ui.theme", "nord")
@@ -742,8 +900,15 @@ class OsuTui(App):
         self.set_status(f"Theme: {new_theme}", color="muted")
 
     def action_force_quit(self) -> None:
-        self._cancel_event.set()
-        self.exit()
+        if self._is_downloading:
+            self.push_screen(ConfirmCancelScreen(), self._on_force_quit)
+        else:
+            self.exit()
+
+    def _on_force_quit(self, result: str | None) -> None:
+        if result == "cancel":
+            self._cancel_event.set()
+            self.exit()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         actions = {
@@ -752,6 +917,8 @@ class OsuTui(App):
             "download-btn": self.action_download_selected,
             "collector-btn": self.load_collection,
             "skip-enrich-btn": self._do_skip_enrichment,
+            "pause-btn": self._toggle_pause,
+            "cancel-btn": self._cancel_downloads,
         }
         handler = actions.get(event.button.id)
         if handler:
@@ -793,6 +960,47 @@ class OsuTui(App):
     def _do_skip_enrichment(self) -> None:
         self._skip_enrich_event.set()
 
+    def _cancel_downloads(self) -> None:
+        self._cancel_event.set()
+        self._pause_event.clear()
+        self._is_paused = False
+        self._pending_indices.clear()
+        self._retry_count.clear()
+        self._set_pause_btn_visible(False)
+        self._set_cancel_btn_visible(False)
+        self.set_status("Cancelling downloads…", color="warn")
+
+    def _toggle_pause(self) -> None:
+        if self._is_paused:
+            self._pause_event.clear()
+            self._is_paused = False
+            self.query_one("#pause-btn", Button).label = "Pause"
+            self.set_status("Resumed — continuing downloads…", color="ok")
+        else:
+            self._pause_event.set()
+            self._is_paused = True
+            self.query_one("#pause-btn", Button).label = "Resume"
+            self.set_status("Paused — click Resume to continue", color="warn")
+
+    def _set_pause_btn_visible(self, visible: bool) -> None:
+        btn = self.query_one("#pause-btn", Button)
+        if visible:
+            btn.remove_class("hidden")
+            btn.add_class("visible")
+        else:
+            btn.remove_class("visible")
+            btn.add_class("hidden")
+            btn.label = "Pause"
+
+    def _set_cancel_btn_visible(self, visible: bool) -> None:
+        btn = self.query_one("#cancel-btn", Button)
+        if visible:
+            btn.remove_class("hidden")
+            btn.add_class("visible")
+        else:
+            btn.remove_class("visible")
+            btn.add_class("hidden")
+
     def load_collection(self) -> None:
         raw = self.query_one("#collector-input", Input).value.strip()
         if not raw:
@@ -803,7 +1011,6 @@ class OsuTui(App):
         if raw.isdigit():
             collection_id = int(raw)
         else:
-            import re
             m = re.search(r"/collections/(\d+)", raw)
             if m:
                 collection_id = int(m.group(1))
@@ -822,7 +1029,6 @@ class OsuTui(App):
                     self.query_one("#client-id", Input).focus()
                 elif result == "continue":
                     self._do_load_collection(collection_id)
-                # "cancel" → do nothing
 
             self.app.push_screen(AuthPromptScreen(), _on_auth_prompt)
             return
@@ -1023,69 +1229,94 @@ class OsuTui(App):
         self.config.set("download.path", path)
         self.config.save()
         self.download_path = path
-        
+
         count = len(indices)
         self.set_status(f"Starting {count} downloads (up to {MAX_PARALLEL_DOWNLOADS} parallel)…", color="muted")
         self.set_progress(0)
 
-        self._completed_counts = {"success": 0, "fail": 0, "done": 0, "total": count}
+        self._is_downloading = True
+        self._is_paused = False
+        self._completed_indices.clear()
+        self._failed_indices.clear()
+        self._pending_indices = list(indices)
+        self._failed_map_names.clear()
+        self._retry_count.clear()
         self._cancel_event.clear()
-        failed_maps: list[str] = []
+        self._pause_event.clear()
+        self.call_later(lambda: self._set_pause_btn_visible(True))
+        self.call_later(lambda: self._set_cancel_btn_visible(True))
         lock = threading.Lock()
 
-        def _download_one(idx: int):
-            if self._cancel_event.is_set():
-                return
-            if not (0 <= idx < len(self.results)):
-                return
+        def worker():
+            while not self._cancel_event.is_set():
+                if self._pause_event.is_set():
+                    time.sleep(0.3)
+                    continue
 
-            b = self.results[idx]
-            beatmap_id = b["id"]
-            artist = b.get("artist", "")
-            title = b.get("title", "")
-            filename = f"{artist} - {title}" if artist and title else str(beatmap_id)
+                idx = None
+                with lock:
+                    if self._pending_indices:
+                        idx = self._pending_indices.pop(0)
 
-            ok, result = self.downloader.download(beatmap_id, path, filename)
+                if idx is None:
+                    with lock:
+                        done = len(self._completed_indices) + len(self._failed_indices)
+                        if done >= count:
+                            return
+                    time.sleep(0.3)
+                    continue
 
-            with lock:
-                self._completed_counts["done"] += 1
-                done = self._completed_counts["done"]
+                b = self.results[idx]
+                beatmap_id = b["id"]
+                artist = b.get("artist", "")
+                title = b.get("title", "")
+                filename = f"{artist} - {title}" if artist and title else str(beatmap_id)
 
-                if ok:
-                    self._completed_counts["success"] += 1
-                else:
-                    self._completed_counts["fail"] += 1
-                    failed_maps.append(f"{filename[:25]}: {result}")
-
-                overall = int(done / count * 100)
-                label = filename[:40]
-                s = self._completed_counts["success"]
-                f_ = self._completed_counts["fail"]
-                self.call_later(
-                    lambda v=overall, lbl=label, sd=s, fd=f_: (
-                        self._set_progress_value(v),
-                        self.set_status(
-                            f"({sd + fd}/{count}) ✓{sd} ✗{fd}  last: {lbl}", color="muted"
-                        ),
-                    )
+                ok, result = self.downloader.download(
+                    beatmap_id, path, filename,
+                    cancel_check=self._cancel_event.is_set,
+                    pause_check=self._pause_event.is_set,
                 )
+
+                should_retry = False
+                with lock:
+                    if ok:
+                        self._completed_indices.add(idx)
+                    elif result in ("cancelled", "paused"):
+                        self._pending_indices.append(idx)
+                    elif result.startswith("all ") and self._retry_count.get(idx, 0) < self._max_retries:
+                        self._retry_count[idx] = self._retry_count.get(idx, 0) + 1
+                        self._pending_indices.append(idx)
+                        should_retry = True
+                    else:
+                        self._failed_indices.add(idx)
+                        self._failed_map_names.append(f"{filename[:25]}: {result}")
+
+                    done = len(self._completed_indices) + len(self._failed_indices)
+                    overall = int(done / count * 100) if count > 0 else 0
+                    sd = len(self._completed_indices)
+                    fd = len(self._failed_indices)
+                    self.call_later(
+                        lambda v=overall, lbl=filename[:40], s=sd, f=fd: (
+                            self._set_progress_value(v),
+                            self.set_status(
+                                f"({s + f}/{count}) ✓{s} ✗{f}  last: {lbl}", color="muted"
+                            ),
+                        )
+                    )
+
+                if should_retry:
+                    time.sleep(15)
+
+        n_workers = min(MAX_PARALLEL_DOWNLOADS, count)
+        threads = [threading.Thread(target=worker, daemon=True) for _ in range(n_workers)]
+        for t in threads:
+            t.start()
 
         def _run():
-            with ThreadPoolExecutor(max_workers=MAX_PARALLEL_DOWNLOADS) as pool:
-                futures = [pool.submit(_download_one, idx) for idx in indices]
-                for f in as_completed(futures):
-                    try:
-                        f.result()
-                    except Exception:
-                        pass
-
-            self.call_later(
-                lambda: self._finish_batch(
-                    self._completed_counts["success"],
-                    self._completed_counts["fail"],
-                    failed_maps,
-                )
-            )
+            for t in threads:
+                t.join()
+            self.call_later(self._finish_batch)
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -1093,8 +1324,16 @@ class OsuTui(App):
         self.query_one("#progress", ProgressBar).update(progress=v)
         self.query_one("#progress-text", Static).update(f"{v}%")
 
-    def _finish_batch(self, success: int, failed: int, failed_maps: list[str]) -> None:
+    def _finish_batch(self) -> None:
+        self._is_downloading = False
+        self._is_paused = False
+        self._set_pause_btn_visible(False)
+        self._set_cancel_btn_visible(False)
         self.set_progress(100, "Done")
+
+        success = len(self._completed_indices)
+        failed = len(self._failed_indices)
+        failed_maps = list(self._failed_map_names)
 
         if success > 0 and failed == 0:
             self.set_status(f"All {success} maps downloaded successfully!", color="ok")
