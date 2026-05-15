@@ -1,10 +1,10 @@
 osu tui downloader
 
-simple terminal ui app to search and download osu! beatmaps
-q: why does this require oauth?
-a: search is implemented using osu.ppy.sh api instead of relying on some other api, osu collector only gives the program map ids and the osu api is used to get other metadata such as artists, titles, creators etc.., this can be skipped and is completely optional
-q: where is my data stored? is it being sent to a server?
-a: no, your data is stored at ~/.config/osu-beatmap/ and it stays there
+simple terminal ui app to search and download osu! beatmaps, now support osu!collector aswell 
+- q: why does this require oauth?
+- a: search is implemented using osu.ppy.sh api instead of some other api, osu collector api only gives map ids and the osu api is used to get other metadata such as artists, titles, creators etc.., this can be skipped and is completely optional
+- q: where is my data stored? is it being sent to a server?
+- a: no, your data is stored at ~/.config/osu-beatmap/ and it stays there
 
 features
 - osu api v2 search
